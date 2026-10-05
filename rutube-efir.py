@@ -166,8 +166,22 @@ def api_get(url, proxies=None, ref=None, json_mode=False):
     return api_get_ex(url, proxies, ref, json_mode)[0]
 
 
+# Ограничение качества потока: (подпись в настройках, высота кадра в px).
+# 0 — без ограничения; значение хранится в QSettings под ключом max_height.
+MAX_HEIGHT_OPTIONS = (
+    ("Без ограничения", 0),
+    ("1440p (2K)", 1440),
+    ("1080p (Full HD)", 1080),
+    ("720p (HD)", 720),
+    ("576p (SD)", 576),
+    ("480p", 480),
+    ("360p", 360),
+    ("240p", 240),
+)
+
+
 def parse_variant_streams(m3u8_text, base_url):
-    """Master-плейлист -> [{pixels, bandwidth, url}] (url приводится к абсолютному)."""
+    """Master-плейлист -> [{pixels, height, bandwidth, url}] (url -> абсолютный)."""
     streams = []
     lines = m3u8_text.splitlines()
     for i, line in enumerate(lines):
@@ -187,10 +201,31 @@ def parse_variant_streams(m3u8_text, base_url):
         b = re.search(r"BANDWIDTH=(\d+)", line)
         streams.append({
             "pixels": int(m.group(1)) * int(m.group(2)) if m else 0,
+            "height": int(m.group(2)) if m else 0,
             "bandwidth": int(b.group(1)) if b else 0,
             "url": url,
         })
     return streams
+
+
+def limit_height(streams, max_height):
+    """Варианты не выше max_height (0 — вернуть всё как есть).
+
+    Если пригодного по высоте нет, возвращаем самые низкие из известных:
+    лучше меньшее качество, чем «поток не найден». Варианты без
+    RESOLUTION (height = 0) ограничение проверять не умеют — когда
+    высота не указана нигде, список не трогаем.
+    """
+    if not max_height:
+        return streams
+    fit = [s for s in streams if 0 < s["height"] <= max_height]
+    if fit:
+        return fit
+    known = [s for s in streams if s["height"]]
+    if not known:
+        return streams
+    low = min(s["height"] for s in known)
+    return [s for s in known if s["height"] == low]
 
 
 def _head_ok(url, proxies, timeout=5):
@@ -203,18 +238,22 @@ def _head_ok(url, proxies, timeout=5):
         return False
 
 
-def pick_best_stream(m3u8_text, base_url, proxies, timeout=5):
+def pick_best_stream(m3u8_text, base_url, proxies, timeout=5, max_height=0):
     """URL потока с максимальным разрешением среди живых (HTTP 200).
 
     Предпочтение:
         1. rtbcdn.ru (если HTTP 200)
         2. любой другой живой URL с максимальным разрешением
+    max_height — потолок по высоте кадра (0 — без ограничения): среди
+    вариантов не выше лимита берётся лучший, а если такого нет — самые
+    низкие (см. limit_height).
     Вариантов нет, но это медиа-плейлист (#EXTINF) — проигрывать надо сам
     запрошенный URL (мы его только что читали, значит, он жив).
     """
     streams = parse_variant_streams(m3u8_text, base_url)
     if not streams:
         return base_url if "#EXTINF" in m3u8_text else None
+    streams = limit_height(streams, max_height)
     # максимум: сначала по разрешению, а если его нет — по BANDWIDTH
     top = max(s["pixels"] for s in streams)
     if top:
@@ -232,13 +271,14 @@ def pick_best_stream(m3u8_text, base_url, proxies, timeout=5):
     return alive[0]
 
 
-def get_stream_url(m3u_page_url, proxies, timeout=5):
+def get_stream_url(m3u_page_url, proxies, timeout=5, max_height=0):
     """Лучший URL потока из m3u8: максимальное разрешение среди живых
-    (HEAD -> 200), предпочтение rtbcdn.ru; медиа-плейлист -> сам URL."""
+    (HEAD -> 200), предпочтение rtbcdn.ru; медиа-плейлист -> сам URL.
+    max_height ограничивает высоту кадра (0 — без ограничения)."""
     text = api_get(m3u_page_url, proxies)
     if not text:
         return None
-    return pick_best_stream(text, m3u_page_url, proxies, timeout)
+    return pick_best_stream(text, m3u_page_url, proxies, timeout, max_height)
 
 
 def pick_field(data, key):
@@ -332,7 +372,7 @@ def blocked_reason(data):
     return "видео недоступно"
 
 
-def parse_play_options(data, proxies=None, with_stream=False):
+def parse_play_options(data, proxies=None, with_stream=False, max_height=0):
     """play/options -> {ok, blocked, reason, url, description, category,
     author, avatar}.
 
@@ -359,7 +399,8 @@ def parse_play_options(data, proxies=None, with_stream=False):
             live = data.get("live_streams")
             hls = live.get("hls") if isinstance(live, dict) else None
             if hls and hls[0].get("url"):
-                out["url"] = get_stream_url(hls[0]["url"], proxies)
+                out["url"] = get_stream_url(hls[0]["url"], proxies,
+                                             max_height=max_height)
         except Exception:
             out["url"] = None
     return out
@@ -370,10 +411,11 @@ def get_channel_info(video_id, proxies):
     return parse_play_options(fetch_play_options(video_id, proxies))
 
 
-def get_stream_by_id(video_id, proxies):
-    """Метаданные + HLS-поток: url = None, если живого потока нет."""
+def get_stream_by_id(video_id, proxies, max_height=0):
+    """Метаданные + HLS-поток: url = None, если живого потока нет.
+    max_height ограничивает высоту кадра (0 — без ограничения)."""
     return parse_play_options(fetch_play_options(video_id, proxies),
-                              proxies, with_stream=True)
+                              proxies, with_stream=True, max_height=max_height)
 
 
 def empty_info():
@@ -737,17 +779,19 @@ class ChannelsWorker(QThread):
 class StreamWorker(QThread):
     resolved = pyqtSignal(str, int, object)  # video_id, token, метаданные+url
 
-    def __init__(self, video_id, token, proxies, parent=None):
+    def __init__(self, video_id, token, proxies, max_height=0, parent=None):
         super().__init__(parent)
         self.video_id = video_id
         self.token = token
         self.proxies = proxies
+        self.max_height = max_height   # потолок качества (0 — без лимита)
 
     def run(self):
         # исключение в потоке PyQt приводит к аварийному останову,
         # поэтому любая ошибка — это «поток не найден», а не падение
         try:
-            info = get_stream_by_id(self.video_id, self.proxies)
+            info = get_stream_by_id(self.video_id, self.proxies,
+                                    self.max_height)
         except Exception:
             traceback.print_exc()
             info = empty_info()
@@ -982,6 +1026,13 @@ class SettingsDialog(QDialog):
         self.prefetch_check.setToolTip(
             "Фоново запрашивать play/options для каналов списка, "
             "чтобы сразу были подкатегории, подсказки и логотипы")
+        self.max_height_label = QLabel("Макс. высота потока:")
+        self.max_height_combo = QComboBox()
+        for text, height in MAX_HEIGHT_OPTIONS:
+            self.max_height_combo.addItem(text, height)
+        self.max_height_combo.setToolTip(
+            "Если плеер тормозит — берётся поток не выше выбранной высоты "
+            "(ограничение качества HLS)")
 
         grid.addWidget(self.api_check, 0, 0)
         grid.addWidget(self.api_edit, 0, 1)
@@ -989,6 +1040,8 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.stream_check, 1, 0)
         grid.addWidget(self.stream_edit, 1, 1)
         grid.addWidget(self.prefetch_check, 2, 0, 1, 3)
+        grid.addWidget(self.max_height_label, 3, 0)
+        grid.addWidget(self.max_height_combo, 3, 1)
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
 
@@ -996,7 +1049,8 @@ class SettingsDialog(QDialog):
             "Пустое поле — прокси не используется. "
             "Схема (http://) добавляется автоматически. "
             "«Из списка…» подставляет адрес из списка hideip.me "
-            "(строки с ':Russia').")
+            "(строки с ':Russia'). Ограничение высоты применяется "
+            "при следующем запуске канала.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888;")
         root.addWidget(hint)
@@ -1013,7 +1067,7 @@ class SettingsDialog(QDialog):
 
     def _widgets(self):
         return (self.api_check, self.api_edit, self.stream_check,
-                self.stream_edit, self.prefetch_check)
+                self.stream_edit, self.prefetch_check, self.max_height_combo)
 
     def _pick_api_proxy(self):
         """Подстановка выбранного адреса из списка hideip.me (':Russia')."""
@@ -1039,6 +1093,9 @@ class SettingsDialog(QDialog):
             self.stream_edit.setText(s.value("stream_proxy", "", type=str))
             self.prefetch_check.setChecked(
                 s.value("prefetch_icons", True, type=bool))
+            idx = self.max_height_combo.findData(
+                s.value("max_height", 0, type=int))
+            self.max_height_combo.setCurrentIndex(idx if idx >= 0 else 0)
         finally:
             for w in self._widgets():
                 w.blockSignals(False)
@@ -1050,6 +1107,7 @@ class SettingsDialog(QDialog):
         s.setValue("stream_proxy_enabled", self.stream_check.isChecked())
         s.setValue("stream_proxy", self.stream_edit.text())
         s.setValue("prefetch_icons", self.prefetch_check.isChecked())
+        s.setValue("max_height", int(self.max_height_combo.currentData() or 0))
         s.sync()
 
     def accept(self):
@@ -1570,6 +1628,11 @@ class MainWindow(QMainWindow):
         if not d.stream_check.isChecked():
             return None
         return normalize_proxy(d.stream_edit.text())
+
+    def stream_max_height(self):
+        """Потолок высоты кадра из настроек: 0 — без ограничения."""
+        d = self.settings_dlg
+        return int(d.max_height_combo.currentData() or 0)
 
     # ---------- каналы ----------
     def refresh_channels(self):
@@ -2152,7 +2215,8 @@ class MainWindow(QMainWindow):
         self._current_title = item.text(0)
 
         # get_stream_by_id — только для выбранного канала
-        w = StreamWorker(video_id, token, self.api_proxies(), self)
+        w = StreamWorker(video_id, token, self.api_proxies(),
+                         self.stream_max_height(), self)
         w.resolved.connect(self._stream_resolved)
         w.finished.connect(lambda w=w: self.stream_workers.discard(w))
         self.stream_workers.add(w)
