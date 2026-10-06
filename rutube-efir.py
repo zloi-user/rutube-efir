@@ -340,11 +340,15 @@ def is_blocked(data):
     """play/options без потока — канал не сможет смотреть, прячем его:
     - {"type": "blocking_rule"} — решение правообладателя или включённый VPN;
     - {"detail": {"type": "player_stub", "name": "login_required"}} — видео
-      скрыто автором, видно только авторизованным.
-    Оба приходят с HTTP 404; JSON-тело на не-200 разбирает api_get_ex.
+      скрыто автором, видно только авторизованным;
+    - "iframe_url": "<url>" (не null) — канал только для встраивания,
+      прямого потока для него нет.
+    Первые два приходят с HTTP 404; JSON-тело на не-200 разбирает api_get_ex.
     """
     if not isinstance(data, dict):
         return False
+    if pick_field(data, "iframe_url"):   # есть значение, а не null — прячем
+        return True
     if data.get("type") in HIDE_DETAIL_TYPES:
         return True
     detail = data.get("detail")
@@ -369,6 +373,8 @@ def blocked_reason(data):
         return "правообладатель или VPN"
     if typ == "player_stub" or name == "login_required":
         return "скрыто автором (нужен вход)"
+    if pick_field(data, "iframe_url"):
+        return "только для встраивания (iframe)"
     return "видео недоступно"
 
 
@@ -703,6 +709,8 @@ def parse_items(data):
             return
         if raw.get("origin_type") == "ifrm":
             return
+        if raw.get("is_paid"):
+            return          # платная трансляция — не показываем
         if vid in seen:
             return
         seen.add(vid)
@@ -1003,6 +1011,11 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        # parent всегда MainWindow (создаётся в его _build_ui): списки
+        # правятся здесь, в состояние приложения уходят только по OK
+        self.win = parent
+        self._hidden_drop = set()   # id скрытых к возврату — только по OK
+        self._syn_drop = set()      # id синонимов к сбросу — только по OK
         self.setWindowTitle("Настройки")
         self.setModal(True)
 
@@ -1044,6 +1057,46 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.max_height_combo, 3, 1)
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
+
+        # ---------- списки: скрытые каналы и правки (синонимы) ----------
+        lists = QHBoxLayout()
+
+        col_hidden = QVBoxLayout()
+        col_hidden.addWidget(QLabel("Скрытые каналы:"))
+        self.hidden_list = QTreeWidget()
+        self.hidden_list.setHeaderLabels(["Канал", "id"])
+        self.hidden_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.hidden_list.setToolTip(
+            "Каналы, скрытые пунктом «Скрыть» контекстного меню")
+        col_hidden.addWidget(self.hidden_list)
+        unhide_btn = QPushButton("Вернуть выбранные")
+        unhide_btn.setToolTip(
+            "Канал снова будет приходить из AUTOWIDGET_URL; "
+            "список обновится автоматически по ОК")
+        unhide_btn.clicked.connect(self._unhide_selected)
+        col_hidden.addWidget(unhide_btn)
+
+        col_syn = QVBoxLayout()
+        col_syn.addWidget(QLabel("Правки каналов (синонимы):"))
+        self.syn_list = QTreeWidget()
+        self.syn_list.setHeaderLabels(["Название", "Группа", "id"])
+        self.syn_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.syn_list.setToolTip(
+            "Переименования/переносы из «Редактировать канал…» "
+            "(правый клик по каналу); удаление возвращает данные Rutube")
+        col_syn.addWidget(self.syn_list)
+        drop_btn = QPushButton("Удалить выбранные")
+        drop_btn.setToolTip(
+            "Сбросить правку — название и группа вернутся из Rutube; "
+            "список обновится автоматически по ОК")
+        drop_btn.clicked.connect(self._drop_syn_selected)
+        col_syn.addWidget(drop_btn)
+
+        lists.addLayout(col_hidden, 1)
+        lists.addLayout(col_syn, 1)
+        root.addLayout(lists)
 
         hint = QLabel(
             "Пустое поле — прокси не используется. "
@@ -1110,11 +1163,75 @@ class SettingsDialog(QDialog):
         s.setValue("max_height", int(self.max_height_combo.currentData() or 0))
         s.sync()
 
+    # ---------- списки скрытых и синонимов ----------
+    def exec(self):
+        """Каждое открытие — свежие списки из состояния MainWindow."""
+        self._fill_lists()
+        return super().exec()
+
+    def _fill_lists(self):
+        self.hidden_list.clear()
+        for vid in sorted(self.win.hidden_ids):
+            title = self.win.hidden_titles.get(vid) or vid   # старый формат
+            item = QTreeWidgetItem([title, vid])
+            item.setData(0, ID_ROLE, vid)
+            self.hidden_list.addTopLevelItem(item)
+        self.hidden_list.resizeColumnToContents(1)
+
+        self.syn_list.clear()
+        for vid, ov in sorted(self.win.synonyms.items(),
+                              key=lambda kv: str(kv[0])):
+            item = QTreeWidgetItem([ov.get("title") or "",
+                                    ov.get("group") or NO_GROUP_LABEL,
+                                    str(vid)])
+            item.setData(0, ID_ROLE, vid)
+            self.syn_list.addTopLevelItem(item)
+        self.syn_list.resizeColumnToContents(2)
+
+    @staticmethod
+    def _selected_ids(tree):
+        return [it.data(0, ID_ROLE) for it in tree.selectedItems()
+                if it.data(0, ID_ROLE) is not None]
+
+    def _unhide_selected(self):
+        """Убрать из списка скрытых; в состояние — только по OK (Cancel
+        перевызывает _fill_lists при следующем открытии)."""
+        for vid in self._selected_ids(self.hidden_list):
+            self._hidden_drop.add(str(vid))
+        for item in self.hidden_list.selectedItems():
+            idx = self.hidden_list.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self.hidden_list.takeTopLevelItem(idx)
+
+    def _drop_syn_selected(self):
+        """Убрать правку из списка синонимов; в состояние — только по OK."""
+        for vid in self._selected_ids(self.syn_list):
+            self._syn_drop.add(str(vid))
+        for item in self.syn_list.selectedItems():
+            idx = self.syn_list.indexOfTopLevelItem(item)
+            if idx >= 0:
+                self.syn_list.takeTopLevelItem(idx)
+
+    def _apply_list_changes(self):
+        """Правки списков уходят в MainWindow по OK; при изменениях
+        список каналов перечитывается — так восстановленные каналы
+        и оригинальные названия станут видны сразу."""
+        hidden_drop, syn_drop = self._hidden_drop, self._syn_drop
+        self._hidden_drop, self._syn_drop = set(), set()
+        if not (hidden_drop or syn_drop):
+            return
+        restored = self.win.restore_channels(hidden_drop)
+        dropped = self.win.drop_synonyms(syn_drop)
+        if restored or dropped:
+            self.win.refresh_channels()
+
     def accept(self):
         self._save()
+        self._apply_list_changes()
         super().accept()
 
     def reject(self):
+        self._hidden_drop, self._syn_drop = set(), set()  # откат списков
         self._load()  # откат несохранённых правок
         super().reject()
 
@@ -1352,6 +1469,9 @@ class MainWindow(QMainWindow):
         self._desc_cache = {}       # id -> description (для кеша списка)
         self.synonyms = {}          # список синонимов: id -> {title, group}
         self._load_synonyms()       # правки пользователя поверх сырого списка
+        self.hidden_ids = set()     # id, скрытые пользователем (постоянно)
+        self.hidden_titles = {}     # id -> название (для списка в настройках)
+        self._load_hidden()         # не подтягивать их из AUTOWIDGET_URL
         self._info_by_id = {}       # id -> метаданные из play/options
         self._info_done = set()     # id, по которым метаданные уже получены
         self._blocked_ids = set()   # id без потока — прячем из списка
@@ -1519,7 +1639,7 @@ class MainWindow(QMainWindow):
 
         self.list.itemClicked.connect(self.play_item)
         self.list.itemActivated.connect(self.play_item)
-        # правый клик по каналу — «Редактировать канал…» (название/группа)
+        # правый клик по каналу — «Редактировать канал…» / «Скрыть»
         self.list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._list_context_menu)
@@ -1618,6 +1738,30 @@ class MainWindow(QMainWindow):
         self.settings.setValue("synonyms",
                                json.dumps(data, ensure_ascii=False))
 
+    def _load_hidden(self):
+        """Скрытые каналы в QSettings (ключ hidden_ids): {id: название};
+        старый формат — просто список id (без названий)."""
+        raw = self.settings.value("hidden_ids", "", type=str)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            for vid, title in data.items():
+                vid = str(vid)
+                self.hidden_ids.add(vid)
+                self.hidden_titles[vid] = str(title or "")
+        elif isinstance(data, (list, tuple)):
+            self.hidden_ids.update(str(v) for v in data)
+
+    def _save_hidden(self):
+        data = {vid: self.hidden_titles.get(vid, "")
+                for vid in sorted(self.hidden_ids)}
+        self.settings.setValue("hidden_ids",
+                               json.dumps(data, ensure_ascii=False))
+
     # ---------- прокси ----------
     def api_proxies(self):
         d = self.settings_dlg
@@ -1677,8 +1821,9 @@ class MainWindow(QMainWindow):
             title = (ov.get("title") or "").strip() \
                 or clean_title(entry.get("title"))   # без «Прямой эфир…»
             if (not vid or not title or vid in self.known_ids
-                    or vid in self._blocked_ids):
-                continue   # заблокированный (blocking_rule) не возвращаем
+                    or vid in self._blocked_ids
+                    or str(vid) in self.hidden_ids):
+                continue   # скрытый пользователем или без потока — не возвращаем
             self.known_ids.add(vid)
 
             # группа: правка (в т.ч. «без группы») против исходной
@@ -1736,15 +1881,20 @@ class MainWindow(QMainWindow):
             else:
                 node.setHidden(bool(needle) and needle not in node.text(0).lower())
 
-    # ---------- список синонимов: правка названия/группы канала ----------
+    # ---------- контекстное меню канала: правка и скрытие ----------
     def _list_context_menu(self, pos):
         item = self.list.itemAt(pos)
         if item is None or not item.data(0, ID_ROLE):
             return   # категории не редактируем — только каналы
         menu = QMenu(self)
         act = menu.addAction("Редактировать канал…")
-        if menu.exec(self.list.viewport().mapToGlobal(pos)) is act:
+        menu.addSeparator()
+        act_hide = menu.addAction("Скрыть")
+        res = menu.exec(self.list.viewport().mapToGlobal(pos))
+        if res is act:
             self._edit_channel_dialog(item)
+        elif res is act_hide:
+            self._hide_channel(item.data(0, ID_ROLE))
 
     def _edit_channel_dialog(self, item):
         vid = item.data(0, ID_ROLE)
@@ -1927,14 +2077,15 @@ class MainWindow(QMainWindow):
         self.apply_filter(self.search.text())
 
     # ---------- недоступные каналы (blocking_rule, скрыто автором) ----------
-    def _hide_blocked(self, video_id, reason=""):
+    def _hide_blocked(self, video_id, reason="", status=None):
         """play/options без потока — убираем канал из списка.
 
         Такие ответы бывают, когда видео заблокировано по решению
         правообладателя/из-за VPN (blocking_rule) либо скрыто автором
         и доступно только авторизованным (player_stub/login_required).
         id запоминаем на сессию, чтобы список (и очередь метаданных)
-        его не вернул; кеш переписываем без него.
+        его не вернул; кеш переписываем без него. status — своя строка
+        для статус-панели (её передаёт пункт «Скрыть»).
         """
         self._blocked_ids.add(video_id)
         if reason:
@@ -1974,7 +2125,55 @@ class MainWindow(QMainWindow):
         self.apply_filter(self.search.text())
         self._save_cache()                     # не вернётся из кеша
         self.statusBar().showMessage(
-            f"Скрыт недоступный канал: {title}")
+            status or f"Скрыт недоступный канал: {title}")
+
+    # ---------- скрытые каналы (пункт «Скрыть» контекстного меню) ----------
+    def _hide_channel(self, video_id):
+        """«Скрыть»: id уходит в постоянный список hidden_ids — при
+        следующей загрузке AUTOWIDGET_URL (и из кеша) канал будет
+        пропущен; элемент убираем тем же путём, что и недоступный.
+        """
+        if not video_id:
+            return
+        item = self._items_by_id.get(video_id)
+        title = item.text(0) if item is not None else str(video_id)
+        self.hidden_ids.add(str(video_id))
+        self.hidden_titles[str(video_id)] = title
+        self._save_hidden()
+        self._hide_blocked(video_id, status=f"Канал скрыт: {title}")
+
+    # ---------- правки списков из настроек (OK диалога настроек) ----------
+    def restore_channels(self, ids):
+        """Возврат скрытых каналов: снять скрытие и сессионную блокировку.
+
+        Сам список обновляет refresh_channels — каналы вернутся из ответа
+        AUTOWIDGET_URL. True — если хоть один id снят.
+        """
+        ids = {str(v) for v in ids}
+        if not ids:
+            return False
+        self.hidden_ids -= ids
+        for vid in ids:
+            self.hidden_titles.pop(vid, None)
+            self._info_done.discard(vid)   # метаданные заново при предзагрузке
+        # _blocked_ids мог получить id в исходном типе ответа API
+        for blocked in list(self._blocked_ids):
+            if str(blocked) in ids:
+                self._blocked_ids.discard(blocked)
+        self._save_hidden()
+        return True
+
+    def drop_synonyms(self, ids):
+        """Сброс правок названия/группы: канал вернётся к данным API
+        после refresh_channels. True — если хоть одна правка снята."""
+        ids = {str(v) for v in ids}
+        dropped = [vid for vid in self.synonyms if str(vid) in ids]
+        if not dropped:
+            return False
+        for vid in dropped:
+            self.synonyms.pop(vid, None)
+        self._save_synonyms()
+        return True
 
     # ---------- логотипы ----------
     def _request_avatar(self, video_id, url):
